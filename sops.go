@@ -493,8 +493,8 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 			}
 			if encrypted {
 				var err error
-				pathString := strings.Join(path, ":") + ":"
-				in, err = cipher.Encrypt(in, key, pathString)
+				//pathString := strings.Join(path, ":") + ":"
+				in, err = cipher.Encrypt(in, key, "")
 				if err != nil {
 					return nil, fmt.Errorf("Could not encrypt value: %s", err)
 				}
@@ -547,9 +547,9 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 			var v interface{}
 			if encrypted {
 				var err error
-				pathString := strings.Join(path, ":") + ":"
+				//pathString := strings.Join(path, ":") + ":"
 				if ok {
-					v, err = cipher.Decrypt(c.Value, key, pathString)
+					v, err = cipher.Decrypt(c.Value, key, "")
 					if err != nil {
 						// Assume the comment was not encrypted in the first place
 						log.WithField("comment", c.Value).
@@ -560,7 +560,7 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 						v = c
 					}
 				} else {
-					v, err = cipher.Decrypt(in.(string), key, pathString)
+					v, err = cipher.Decrypt(in.(string), key, "")
 					if err != nil {
 						return nil, fmt.Errorf("Could not decrypt value: %s", err)
 					}

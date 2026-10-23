@@ -27,42 +27,54 @@ type testPKI struct {
 	leaf    *x509.Certificate
 	leafKey *ecdsa.PrivateKey
 }
+
+// issueCert generates a key and certificate for cn with the given serial. Can
+// be a CA or leaf dependening on isCa flag. is self-signed when parent is nil
+func issueCert(
+	t *testing.T,
+	cn string,
+	serial int64,
+	isCA bool,
+	parent *x509.Certificate,
+	parentKey *ecdsa.PrivateKey,
+) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	if isCA {
+		tmpl.IsCA = true
+		tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+		tmpl.BasicConstraintsValid = true
+	} else {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		tmpl.DNSNames = []string{cn}
+	}
+
+	signer, signerKey := tmpl, key // self-signed by default
+	if parent != nil {
+		signer, signerKey = parent, parentKey
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, signer, &key.PublicKey, signerKey)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	return cert, key
+}
+
 func newTestPKI(t *testing.T) *testPKI {
 	t.Helper()
 
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	caTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Test Vault CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	require.NoError(t, err)
-	caCert, err := x509.ParseCertificate(caDER)
-	require.NoError(t, err)
-
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	leafTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(42),
-		Subject:      pkix.Name{CommonName: "vault.example.com"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"vault.example.com"},
-	}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
-	require.NoError(t, err)
-	leaf, err := x509.ParseCertificate(leafDER)
-	require.NoError(t, err)
+	caCert, caKey := issueCert(t, "Test Vault CA", 1, true, nil, nil)
+	leaf, leafKey := issueCert(t, "vault.example.com", 42, false, caCert, caKey)
 
 	return &testPKI{caCert: caCert, caKey: caKey, leaf: leaf, leafKey: leafKey}
 }
@@ -77,50 +89,16 @@ func (p *testPKI) crl(t *testing.T, serials ...*big.Int) *x509.RevocationList {
 // revoking the given serial numbers.
 func (p *testPKI) expiredCRL(t *testing.T, serials ...*big.Int) *x509.RevocationList {
 	t.Helper()
-
-	var entries []x509.RevocationListEntry
-	for _, s := range serials {
-		entries = append(entries, x509.RevocationListEntry{
-			SerialNumber:   s,
-			RevocationTime: time.Now().Add(-2 * time.Hour),
-		})
-	}
-	tmpl := &x509.RevocationList{
-		Number:                    big.NewInt(1),
-		ThisUpdate:                time.Now().Add(-2 * time.Hour),
-		NextUpdate:                time.Now().Add(-time.Hour),
-		RevokedCertificateEntries: entries,
-	}
-	der, err := x509.CreateRevocationList(rand.Reader, tmpl, p.caCert, p.caKey)
-	require.NoError(t, err)
-	crl, err := x509.ParseRevocationList(der)
-	require.NoError(t, err)
-	return crl
+	now := time.Now()
+	return buildCRL(t, p.caCert, p.caKey, now.Add(-2*time.Hour), now.Add(-time.Hour), serials...)
 }
 
 // notYetValidCRL builds a CRL signed by the CA whose ThisUpdate is in the
 // future, so it is not yet in effect, revoking the given serial numbers.
 func (p *testPKI) notYetValidCRL(t *testing.T, serials ...*big.Int) *x509.RevocationList {
 	t.Helper()
-
-	var entries []x509.RevocationListEntry
-	for _, s := range serials {
-		entries = append(entries, x509.RevocationListEntry{
-			SerialNumber:   s,
-			RevocationTime: time.Now().Add(time.Hour),
-		})
-	}
-	tmpl := &x509.RevocationList{
-		Number:                    big.NewInt(1),
-		ThisUpdate:                time.Now().Add(time.Hour),
-		NextUpdate:                time.Now().Add(2 * time.Hour),
-		RevokedCertificateEntries: entries,
-	}
-	der, err := x509.CreateRevocationList(rand.Reader, tmpl, p.caCert, p.caKey)
-	require.NoError(t, err)
-	crl, err := x509.ParseRevocationList(der)
-	require.NoError(t, err)
-	return crl
+	now := time.Now()
+	return buildCRL(t, p.caCert, p.caKey, now.Add(time.Hour), now.Add(2*time.Hour), serials...)
 }
 
 // verifiedChain mimics the verifiedChains argument TLS passes to
@@ -149,53 +127,9 @@ type testChainPKI struct {
 func newTestChainPKI(t *testing.T) *testChainPKI {
 	t.Helper()
 
-	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	rootTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Test Root CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-	}
-	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
-	require.NoError(t, err)
-	rootCert, err := x509.ParseCertificate(rootDER)
-	require.NoError(t, err)
-
-	intKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	intTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(2),
-		Subject:               pkix.Name{CommonName: "Test Intermediate CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-	}
-	intDER, err := x509.CreateCertificate(rand.Reader, intTmpl, rootCert, &intKey.PublicKey, rootKey)
-	require.NoError(t, err)
-	intCert, err := x509.ParseCertificate(intDER)
-	require.NoError(t, err)
-
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	leafTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(42),
-		Subject:      pkix.Name{CommonName: "vault.example.com"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"vault.example.com"},
-	}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, intCert, &leafKey.PublicKey, intKey)
-	require.NoError(t, err)
-	leaf, err := x509.ParseCertificate(leafDER)
-	require.NoError(t, err)
+	rootCert, rootKey := issueCert(t, "Test Root CA", 1, true, nil, nil)
+	intCert, intKey := issueCert(t, "Test Intermediate CA", 2, true, rootCert, rootKey)
+	leaf, leafKey := issueCert(t, "vault.example.com", 42, false, intCert, intKey)
 
 	return &testChainPKI{
 		rootCert: rootCert, rootKey: rootKey,
@@ -210,22 +144,28 @@ func (p *testChainPKI) verifiedChain() [][]*x509.Certificate {
 	return [][]*x509.Certificate{{p.leaf, p.intCert, p.rootCert}}
 }
 
-// crlSignedBy builds a CRL signed by the given issuer/key, revoking the given
-// serial numbers.
-func crlSignedBy(t *testing.T, issuer *x509.Certificate, key *ecdsa.PrivateKey, serials ...*big.Int) *x509.RevocationList {
+// buildCRL builds a CRL signed by the given issuer/key with explicit validity
+// window, revoking the given serial numbers.
+func buildCRL(
+	t *testing.T,
+	issuer *x509.Certificate,
+	key *ecdsa.PrivateKey,
+	thisUpdate, nextUpdate time.Time,
+	serials ...*big.Int,
+) *x509.RevocationList {
 	t.Helper()
 
 	var entries []x509.RevocationListEntry
 	for _, s := range serials {
 		entries = append(entries, x509.RevocationListEntry{
 			SerialNumber:   s,
-			RevocationTime: time.Now().Add(-time.Minute),
+			RevocationTime: thisUpdate,
 		})
 	}
 	tmpl := &x509.RevocationList{
 		Number:                    big.NewInt(1),
-		ThisUpdate:                time.Now().Add(-time.Minute),
-		NextUpdate:                time.Now().Add(time.Hour),
+		ThisUpdate:                thisUpdate,
+		NextUpdate:                nextUpdate,
 		RevokedCertificateEntries: entries,
 	}
 	der, err := x509.CreateRevocationList(rand.Reader, tmpl, issuer, key)
@@ -233,6 +173,14 @@ func crlSignedBy(t *testing.T, issuer *x509.Certificate, key *ecdsa.PrivateKey, 
 	crl, err := x509.ParseRevocationList(der)
 	require.NoError(t, err)
 	return crl
+}
+
+// crlSignedBy builds a CRL signed by the given issuer/key,
+// revoking the given serial numbers.
+func crlSignedBy(t *testing.T, issuer *x509.Certificate, key *ecdsa.PrivateKey, serials ...*big.Int) *x509.RevocationList {
+	t.Helper()
+	now := time.Now()
+	return buildCRL(t, issuer, key, now.Add(-time.Minute), now.Add(time.Hour), serials...)
 }
 
 // leafCRL builds the CRL for the leaf, signed by the intermediate.

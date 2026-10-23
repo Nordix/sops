@@ -396,6 +396,9 @@ func dataKeyFromSecret(secret *api.Secret) ([]byte, error) {
 // and token.
 func vaultClient(address, token string, hc *http.Client) (*api.Client, error) {
 	cfg := api.DefaultConfig()
+	if cfg.Error != nil {
+		return nil, fmt.Errorf("cannot create default Vault config: %w", cfg.Error)
+	}
 	cfg.Address = address
 
 	allowlist, err := getAllowlist()
@@ -406,6 +409,13 @@ func vaultClient(address, token string, hc *http.Client) (*api.Client, error) {
 		return nil, fmt.Errorf("Allowlist does not allow %s", address)
 	}
 
+	// cfg.HttpClient uses the Vault API's environment TLS settings
+	// (VAULT_CACERT, VAULT_CLIENT_CERT, ...) for CRL checking when no
+	// client is added
+	hc, err = configureCRL(address, hc, cfg.HttpClient)
+	if err != nil {
+		return nil, err
+	}
 	if hc != nil {
 		cfg.HttpClient = hc
 	}

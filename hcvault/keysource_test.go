@@ -1,6 +1,8 @@
 package hcvault
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	logger "log"
 	"os"
@@ -682,4 +684,114 @@ func TestAllowlistAllow(t *testing.T) {
 	assert.Equal(t, al.Allows("http://foo:8080"), false)
 	assert.Equal(t, al.Allows("http://foo:8080/"), false)
 	assert.Equal(t, al.Allows(""), false)
+}
+
+// --- Static CRL fixtures ---------------------------------------------------
+//
+// The following tests exercise the CRL verification logic against fixed PEM
+// material read from the testdata directory rather than certificates and CRLs
+// generated at runtime. Intentionally independent of crl_test.go.
+//
+// The fixtures were generated once with OpenSSL (P-256/ECDSA) and have a
+// ~100 year validity window so the CRLs never expire for the purposes of
+// these tests:
+//
+//   - testdata/static_ca.pem:           self-signed CA ("Test Vault Static CA").
+//   - testdata/static_leaf.pem:         leaf "vault.example.com", serial 42,
+//     signed by the CA above.
+//   - testdata/static_revoked.crl.pem:  CRL signed by the CA revoking serial
+//     42 (the leaf).
+//   - testdata/static_empty.crl.pem:    CRL signed by the CA revoking nothing.
+const (
+	staticCACertPath     = "testdata/static_ca.pem"
+	staticLeafCertPath   = "testdata/static_leaf.pem"
+	staticRevokedCRLPath = "testdata/static_revoked.crl.pem"
+	staticEmptyCRLPath   = "testdata/static_empty.crl.pem"
+)
+
+// reads a fixture file from the testdata directory.
+func readStaticFixture(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cannot read static fixture %q: %v", path, err)
+	}
+	return data
+}
+
+// reads and decodes a single PEM-encoded certificate fixture.
+func parseStaticCert(t *testing.T, path string) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode(readStaticFixture(t, path))
+	if block == nil {
+		t.Fatalf("static fixture %q does not contain a PEM block", path)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	assert.NoError(t, err)
+	return cert
+}
+
+// ßmimics the verifiedChains argument TLS passes to
+// VerifyPeerCertificate: leaf first, issuer (CA) second.
+func staticVerifiedChain(t *testing.T) [][]*x509.Certificate {
+	t.Helper()
+	leaf := parseStaticCert(t, staticLeafCertPath)
+	ca := parseStaticCert(t, staticCACertPath)
+	return [][]*x509.Certificate{{leaf, ca}}
+}
+
+func TestStaticFixturesSanity(t *testing.T) {
+	leaf := parseStaticCert(t, staticLeafCertPath)
+	ca := parseStaticCert(t, staticCACertPath)
+
+	// The leaf fixture must be the one we expect: CN and serial 42.
+	assert.Equal(t, "vault.example.com", leaf.Subject.CommonName)
+	assert.Equal(t, int64(42), leaf.SerialNumber.Int64())
+
+	// The CA must actually be the issuer of the leaf.
+	assert.NoError(t, leaf.CheckSignatureFrom(ca))
+}
+
+func TestParseCRLs_StaticFixture(t *testing.T) {
+	crls, err := parseCRLs(readStaticFixture(t, staticRevokedCRLPath))
+	assert.NoError(t, err)
+	if assert.Len(t, crls, 1) {
+		ca := parseStaticCert(t, staticCACertPath)
+		// The static CRL must verify against the static CA...
+		assert.NoError(t, crls[0].CheckSignatureFrom(ca))
+		// ...and list exactly the leaf serial (42).
+		if assert.Len(t, crls[0].RevokedCertificateEntries, 1) {
+			assert.Equal(t, int64(42), crls[0].RevokedCertificateEntries[0].SerialNumber.Int64())
+		}
+	}
+}
+
+func TestNewCRLVerifier_StaticFixtures(t *testing.T) {
+	t.Run("static revoked leaf is rejected", func(t *testing.T) {
+		crls, err := parseCRLs(readStaticFixture(t, staticRevokedCRLPath))
+		assert.NoError(t, err)
+
+		verify := newCRLVerifier(crls)
+		err = verify(nil, staticVerifiedChain(t))
+		assert.Error(t, err)
+		assert.ErrorContains(t, err, "has been revoked")
+	})
+
+	t.Run("static empty CRL lets the leaf pass", func(t *testing.T) {
+		crls, err := parseCRLs(readStaticFixture(t, staticEmptyCRLPath))
+		assert.NoError(t, err)
+
+		verify := newCRLVerifier(crls)
+		err = verify(nil, staticVerifiedChain(t))
+		assert.NoError(t, err)
+	})
+}
+
+func TestLoadCRLs_StaticFixture(t *testing.T) {
+	crls, err := loadCRLs([]string{staticRevokedCRLPath})
+	assert.NoError(t, err)
+	if assert.Len(t, crls, 1) {
+		ca := parseStaticCert(t, staticCACertPath)
+		assert.NoError(t, crls[0].CheckSignatureFrom(ca))
+	}
 }

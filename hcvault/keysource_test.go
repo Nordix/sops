@@ -1,10 +1,11 @@
 package hcvault
 
 import (
+	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	logger "log"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -29,6 +30,10 @@ var (
 	// testVaultAddress is the HTTP/S address of the Vault server, it is set
 	// by TestMain after booting it.
 	testVaultAddress string
+	// testVaultAddressHTTPS is the HTTPS address of the Vault server's TLS
+	// listener, set by TestMain. Uses certificate and CRL from testdata folder
+	// See testdata/README.md.
+	testVaultAddressHTTPS string
 	// Whether to skip all Docker-based tests.
 	testSkipDocker = false
 )
@@ -49,8 +54,31 @@ func TestMain(m *testing.M) {
 		logger.Fatalf("could not connect to docker: %s", err)
 	}
 
-	// Pull the image, create a container based on it, and run it
-	resource, err := pool.Run("ghcr.io/getsops/ci-container-images/vault", testVaultVersion, []string{"VAULT_DEV_ROOT_TOKEN_ID=" + testVaultToken})
+	// Pull the image, create a container based on it, and run it. Besides the
+	// default dev-mode HTTP listener on 8200, add a TLS listener on 8300 using
+	// certificate and CRL from testdata folder, mounted as read-only directory
+	// into the container
+	fixturesDir, err := filepath.Abs("testdata")
+	if err != nil {
+		logger.Fatalf("could not resolve testdata dir: %s", err)
+	}
+	tlsListenerConfig := `listener "tcp" {
+  address       = "0.0.0.0:8300"
+  tls_cert_file = "/fixtures/static_leaf.pem"
+  tls_key_file  = "/fixtures/static_leaf.key"
+}`
+
+	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+		Repository:   "ghcr.io/getsops/ci-container-images/vault",
+		Tag:          testVaultVersion,
+		ExposedPorts: []string{"8200/tcp", "8300/tcp"},
+		Env: []string{
+			"VAULT_DEV_ROOT_TOKEN_ID=" + testVaultToken,
+			"VAULT_LOCAL_CONFIG=" + tlsListenerConfig,
+		},
+		Mounts: []string{fixturesDir + ":/fixtures:ro"},
+		CapAdd: []string{"IPC_LOCK"},
+	})
 	if err != nil {
 		logger.Fatalf("could not start resource: %s", err)
 	}
@@ -62,6 +90,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testVaultAddress = fmt.Sprintf("http://127.0.0.1:%v", resource.GetPort("8200/tcp"))
+	testVaultAddressHTTPS = fmt.Sprintf("https://127.0.0.1:%v", resource.GetPort("8300/tcp"))
 	// Wait until Vault is ready to serve requests
 	if err := pool.Retry(func() error {
 		cfg := api.DefaultConfig()
@@ -686,112 +715,104 @@ func TestAllowlistAllow(t *testing.T) {
 	assert.Equal(t, al.Allows(""), false)
 }
 
-// --- Static CRL fixtures ---------------------------------------------------
-//
-// The following tests exercise the CRL verification logic against fixed PEM
-// material read from the testdata directory rather than certificates and CRLs
-// generated at runtime. Intentionally independent of crl_test.go.
-//
-// The fixtures were generated once with OpenSSL (P-256/ECDSA) and have a
-// ~100 year validity window so the CRLs never expire for the purposes of
-// these tests:
+// The fixtures are committed PEM/key material (see testdata/README.md),
+// generated with OpenSSL (P-256/ECDSA) and given a ~100 year validity window
+// so they do not expire for the purposes of these tests.
 //
 //   - testdata/static_ca.pem:           self-signed CA ("Test Vault Static CA").
 //   - testdata/static_leaf.pem:         leaf "vault.example.com", serial 42,
 //     signed by the CA above.
-//   - testdata/static_revoked.crl.pem:  CRL signed by the CA revoking serial
-//     42 (the leaf).
+//   - testdata/static_leaf.key:         the leaf's private key, used to serve TLS.
+//   - testdata/static_revoked.crl.pem:  CRL signed by the CA revoking serial 42.
 //   - testdata/static_empty.crl.pem:    CRL signed by the CA revoking nothing.
 const (
 	staticCACertPath     = "testdata/static_ca.pem"
-	staticLeafCertPath   = "testdata/static_leaf.pem"
 	staticRevokedCRLPath = "testdata/static_revoked.crl.pem"
 	staticEmptyCRLPath   = "testdata/static_empty.crl.pem"
+
+	// staticLeafServerName is the leaf certificate's SAN; the injected client
+	// pins to it so TLS hostname verification succeeds against the 127.0.0.1
+	// Vault listener.
+	staticLeafServerName = "vault.example.com"
 )
 
-// reads a fixture file from the testdata directory.
-func readStaticFixture(t *testing.T, path string) []byte {
+// newStaticCRLClient returns an HTTP client that trusts the static CA and pins
+// the server name to the leaf's SAN, matching what a real Vault client
+// configured via VAULT_CACERT / VAULT_TLS_SERVER_NAME would do.
+func newStaticCRLClient(t *testing.T) *http.Client {
 	t.Helper()
-	data, err := os.ReadFile(path)
+
+	caPEM, err := os.ReadFile(staticCACertPath)
 	if err != nil {
-		t.Fatalf("cannot read static fixture %q: %v", path, err)
+		t.Fatalf("cannot read static CA: %v", err)
 	}
-	return data
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		t.Fatalf("cannot add static CA to pool")
+	}
+
+	return &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs:    pool,
+			ServerName: staticLeafServerName,
+			MinVersion: tls.VersionTLS12,
+		},
+	}}
 }
 
-// reads and decodes a single PEM-encoded certificate fixture.
-func parseStaticCert(t *testing.T, path string) *x509.Certificate {
+// newHTTPSMasterKey builds a MasterKey for keyName pointing at the Vault
+// server's HTTPS listener, with the static-CA trusting client injected.
+func newHTTPSMasterKey(t *testing.T, keyName string) *MasterKey {
 	t.Helper()
-	block, _ := pem.Decode(readStaticFixture(t, path))
-	if block == nil {
-		t.Fatalf("static fixture %q does not contain a PEM block", path)
+	key := NewMasterKey(testVaultAddressHTTPS, testEnginePath, keyName)
+	Token(testVaultToken).ApplyToMasterKey(key)
+	NewHTTPClient(newStaticCRLClient(t)).ApplyToMasterKey(key)
+	return key
+}
+
+func TestMasterKey_CRL_EndToEnd(t *testing.T) {
+	if testSkipDocker {
+		t.SkipNow()
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	assert.NoError(t, err)
-	return cert
-}
 
-// ßmimics the verifiedChains argument TLS passes to
-// VerifyPeerCertificate: leaf first, issuer (CA) second.
-func staticVerifiedChain(t *testing.T) [][]*x509.Certificate {
-	t.Helper()
-	leaf := parseStaticCert(t, staticLeafCertPath)
-	ca := parseStaticCert(t, staticCACertPath)
-	return [][]*x509.Certificate{{leaf, ca}}
-}
+	// Create the transit key over the plain-HTTP listener (createVaultKey uses
+	// the default Vault client, which does not trust the static CA). The key
+	// lives in the shared transit engine, so the HTTPS calls below reach the
+	// same key.
+	setupKey := NewMasterKey(testVaultAddress, testEnginePath, "crl-e2e")
+	Token(testVaultToken).ApplyToMasterKey(setupKey)
+	assert.NoError(t, createVaultKey(setupKey))
 
-func TestStaticFixturesSanity(t *testing.T) {
-	leaf := parseStaticCert(t, staticLeafCertPath)
-	ca := parseStaticCert(t, staticCACertPath)
+	// A revoked leaf must make the TLS handshake fail, so neither Encrypt nor
+	// Decrypt can reach the Vault backend.
+	t.Run("revoked leaf aborts Encrypt and Decrypt", func(t *testing.T) {
+		t.Setenv(SopsHCVaultCRLFile, staticRevokedCRLPath)
+		// to stop retry for this particular test as failure is expected
+		t.Setenv("VAULT_MAX_RETRIES", "0")
+		key := newHTTPSMasterKey(t, "crl-e2e")
 
-	// The leaf fixture must be the one we expect: CN and serial 42.
-	assert.Equal(t, "vault.example.com", leaf.Subject.CommonName)
-	assert.Equal(t, int64(42), leaf.SerialNumber.Int64())
+		err := key.Encrypt([]byte("the data key"))
+		assert.Error(t, err)
+		assert.ErrorContains(t, err, "has been revoked")
 
-	// The CA must actually be the issuer of the leaf.
-	assert.NoError(t, leaf.CheckSignatureFrom(ca))
-}
-
-func TestParseCRLs_StaticFixture(t *testing.T) {
-	crls, err := parseCRLs(readStaticFixture(t, staticRevokedCRLPath))
-	assert.NoError(t, err)
-	if assert.Len(t, crls, 1) {
-		ca := parseStaticCert(t, staticCACertPath)
-		// The static CRL must verify against the static CA...
-		assert.NoError(t, crls[0].CheckSignatureFrom(ca))
-		// ...and list exactly the leaf serial (42).
-		if assert.Len(t, crls[0].RevokedCertificateEntries, 1) {
-			assert.Equal(t, int64(42), crls[0].RevokedCertificateEntries[0].SerialNumber.Int64())
-		}
-	}
-}
-
-func TestNewCRLVerifier_StaticFixtures(t *testing.T) {
-	t.Run("static revoked leaf is rejected", func(t *testing.T) {
-		crls, err := parseCRLs(readStaticFixture(t, staticRevokedCRLPath))
-		assert.NoError(t, err)
-
-		verify := newCRLVerifier(crls)
-		err = verify(nil, staticVerifiedChain(t))
+		key.EncryptedKey = "vault:v1:ignored"
+		_, err = key.Decrypt()
 		assert.Error(t, err)
 		assert.ErrorContains(t, err, "has been revoked")
 	})
 
-	t.Run("static empty CRL lets the leaf pass", func(t *testing.T) {
-		crls, err := parseCRLs(readStaticFixture(t, staticEmptyCRLPath))
-		assert.NoError(t, err)
+	// With a CRL that revokes nothing, CRL verification passes and a full
+	// Encrypt/Decrypt round trip completes against the Vault server over HTTPS.
+	t.Run("empty CRL permits Encrypt and Decrypt", func(t *testing.T) {
+		t.Setenv(SopsHCVaultCRLFile, staticEmptyCRLPath)
+		key := newHTTPSMasterKey(t, "crl-e2e")
 
-		verify := newCRLVerifier(crls)
-		err = verify(nil, staticVerifiedChain(t))
+		dataKey := []byte("the data key")
+		assert.NoError(t, key.Encrypt(dataKey))
+		assert.NotEmpty(t, key.EncryptedKey)
+
+		got, err := key.Decrypt()
 		assert.NoError(t, err)
+		assert.Equal(t, dataKey, got)
 	})
-}
-
-func TestLoadCRLs_StaticFixture(t *testing.T) {
-	crls, err := loadCRLs([]string{staticRevokedCRLPath})
-	assert.NoError(t, err)
-	if assert.Len(t, crls, 1) {
-		ca := parseStaticCert(t, staticCACertPath)
-		assert.NoError(t, crls[0].CheckSignatureFrom(ca))
-	}
 }

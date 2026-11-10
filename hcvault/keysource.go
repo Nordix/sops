@@ -409,10 +409,12 @@ func vaultClient(address, token string, hc *http.Client) (*api.Client, error) {
 		return nil, fmt.Errorf("Allowlist does not allow %s", address)
 	}
 
-	// cfg.HttpClient uses the Vault API's environment TLS settings
-	// (VAULT_CACERT, VAULT_CLIENT_CERT, ...) for CRL checking when no
-	// client is added
-	hc, err = configureCRL(address, hc, cfg.HttpClient)
+	target := hc
+	if target == nil {
+		target = cfg.HttpClient
+	}
+
+	hc, err = configureCRL(address, target)
 	if err != nil {
 		return nil, err
 	}

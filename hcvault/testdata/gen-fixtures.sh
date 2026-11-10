@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 #
-# Regenerates the static CRL test fixtures in this directory
-# (static_ca.pem, static_leaf.pem, static_revoked.crl.pem, static_empty.crl.pem).
+# Regenerates the static CRL test fixtures in this directory:
+#   static_ca.pem, static_leaf.pem, static_leaf.key,
+#   static_revoked.crl.pem, static_empty.crl.pem
 #
-# Overwrites the four fixture files in place and cleans up every intermediate
-# it creates. Run it from anywhere; it operates on its own directory.
+# static_leaf.key is the leaf's private key; the end-to-end tests use it to
+# stand up a TLS server that presents static_leaf.pem. It is a throwaway test
+# key, not a secret.
+#
+# Overwrites the fixture files in place and cleans up every intermediate it
+# creates. Run it from anywhere; it operates on its own directory.
 #
 #   ./gen-fixtures.sh
 #
@@ -12,8 +17,7 @@
 #
 #   ./gen-fixtures.sh 255
 #
-# If you change the serial, also update the `int64(42)` assertions in
-# ../keysource_test.go to match.
+# The serial is opaque to the end-to-end tests, so no Go changes are needed.
 
 set -euo pipefail
 
@@ -25,7 +29,7 @@ leaf_serial="${1:-42}"
 leaf_serial_hex=$(printf '%X' "$leaf_serial")
 
 cleanup() {
-  rm -rf ca.key leaf.key leaf.csr leaf.ext openssl.cnf demoCA
+  rm -rf ca.key leaf.csr leaf.ext openssl.cnf demoCA
 }
 trap cleanup EXIT
 
@@ -38,8 +42,8 @@ openssl req -x509 -new -key ca.key -sha256 -days 36500 \
   -set_serial 1 -out static_ca.pem
 
 # ---- Leaf (signed by the CA) ------------------------------------------------
-openssl ecparam -name prime256v1 -genkey -noout -out leaf.key
-openssl req -new -key leaf.key -subj "/CN=vault.example.com" -out leaf.csr
+openssl ecparam -name prime256v1 -genkey -noout -out static_leaf.key
+openssl req -new -key static_leaf.key -subj "/CN=vault.example.com" -out leaf.csr
 cat > leaf.ext <<'EOF'
 keyUsage=critical,digitalSignature
 extendedKeyUsage=serverAuth

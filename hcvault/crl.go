@@ -60,6 +60,46 @@ func loadCRLs(paths []string) ([]*x509.RevocationList, error) {
 	return crls, nil
 }
 
+// applyCRLToClient returns an *http.Client, derived from client, whose TLS
+// configuration performs CRL checking of the Vault server's certificate chain.
+// The provided client is not mutated.
+func applyCRLToClient(client *http.Client, crls []*x509.RevocationList) (*http.Client, error) {
+	c := *client
+
+	var transport *http.Transport
+	switch rt := client.Transport.(type) {
+	case nil:
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	case *http.Transport:
+		transport = rt.Clone()
+	default:
+		return nil, fmt.Errorf("cannot enable CRL checking: HTTP client uses a non-standard transport (%T)", client.Transport)
+	}
+
+	var tlsConfig *tls.Config
+	if transport.TLSClientConfig != nil {
+		tlsConfig = transport.TLSClientConfig.Clone()
+	} else {
+		tlsConfig = &tls.Config{}
+	}
+
+	crlVerify := newCRLVerifier(crls)
+	if existing := tlsConfig.VerifyPeerCertificate; existing != nil {
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if err := existing(rawCerts, verifiedChains); err != nil {
+				return err
+			}
+			return crlVerify(rawCerts, verifiedChains)
+		}
+	} else {
+		tlsConfig.VerifyPeerCertificate = crlVerify
+	}
+
+	transport.TLSClientConfig = tlsConfig
+	c.Transport = transport
+	return &c, nil
+}
+
 // parseCRLs parses one or more CRLs from the given bytes. It supports
 // PEM-encoded input (possibly containing multiple "X509 CRL" blocks) as well
 // as a single DER-encoded CRL.
@@ -130,7 +170,17 @@ func verifyCertificateCRL(
 	crls []*x509.RevocationList,
 	now time.Time,
 ) error {
-	applicable := findApplicableCRLs(crls, issuer, now)
+	var applicable []*x509.RevocationList
+	for _, crl := range crls {
+		if crl.CheckSignatureFrom(issuer) != nil {
+			continue
+		}
+		if !isCRLCurrentlyValid(crl, now) {
+			continue
+		}
+		applicable = append(applicable, crl)
+	}
+
 	if len(applicable) == 0 {
 		return fmt.Errorf(
 			"no valid CRL found for issuer %q of vault server certificate chain (certificate %q)",
@@ -151,25 +201,6 @@ func verifyCertificateCRL(
 	return nil
 }
 
-func findApplicableCRLs(
-	crls []*x509.RevocationList,
-	issuer *x509.Certificate,
-	now time.Time,
-) []*x509.RevocationList {
-	var applicable []*x509.RevocationList
-
-	for _, crl := range crls {
-		if crl.CheckSignatureFrom(issuer) != nil {
-			continue
-		}
-		if !isCRLCurrentlyValid(crl, now) {
-			continue
-		}
-		applicable = append(applicable, crl)
-	}
-	return applicable
-}
-
 func isCRLCurrentlyValid(crl *x509.RevocationList, now time.Time) bool {
 	if !crl.NextUpdate.IsZero() && now.After(crl.NextUpdate) {
 		return false
@@ -186,63 +217,16 @@ func isCertificateRevoked(cert *x509.Certificate, crl *x509.RevocationList) bool
 	return false
 }
 
-// applyCRLToClient returns an *http.Client, derived from hc (or a sensible
-// default when hc is nil), whose TLS configuration performs CRL checking of
-// the Vault server's leaf certificate. If hc is provided, the values are not changed.
-func applyCRLToClient(hc *http.Client, crls []*x509.RevocationList) (*http.Client, error) {
-	var client http.Client
-	var transport *http.Transport
-
-	switch {
-	case hc == nil:
-		client = http.Client{}
-		transport = http.DefaultTransport.(*http.Transport).Clone()
-	default:
-		client = *hc
-		switch rt := hc.Transport.(type) {
-		case nil:
-			transport = http.DefaultTransport.(*http.Transport).Clone()
-		case *http.Transport:
-			transport = rt.Clone()
-		default:
-			return nil, fmt.Errorf("cannot enable CRL checking: injected HTTP client uses a non-standard transport (%T)", hc.Transport)
-		}
-	}
-
-	var tlsConfig *tls.Config
-	if transport.TLSClientConfig != nil {
-		tlsConfig = transport.TLSClientConfig.Clone()
-	} else {
-		tlsConfig = &tls.Config{}
-	}
-
-	crlVerify := newCRLVerifier(crls)
-	if existing := tlsConfig.VerifyPeerCertificate; existing != nil {
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			if err := existing(rawCerts, verifiedChains); err != nil {
-				return err
-			}
-			return crlVerify(rawCerts, verifiedChains)
-		}
-	} else {
-		tlsConfig.VerifyPeerCertificate = crlVerify
-	}
-
-	transport.TLSClientConfig = tlsConfig
-	client.Transport = transport
-	return &client, nil
-}
-
 // configureCRL enables CRL checking when SopsHCVaultCRLFile is set.
-// Requires an https Vault address. Layers verification onto hc if
-// injected, otherwise base, preserving Vault's environment-derived TLS settings.
-func configureCRL(address string, hc, base *http.Client) (*http.Client, error) {
+// Requires an https Vault address. When enabled it layers CRL verification
+// onto client, preserving its existing TLS settings.
+func configureCRL(address string, client *http.Client) (*http.Client, error) {
 	paths, err := getCRLFiles()
 	if err != nil {
 		return nil, err
 	}
 	if len(paths) == 0 {
-		return hc, nil
+		return client, nil
 	}
 
 	if !strings.HasPrefix(strings.ToLower(address), "https://") {
@@ -256,10 +240,5 @@ func configureCRL(address string, hc, base *http.Client) (*http.Client, error) {
 		return nil, err
 	}
 
-	target := hc
-	if target == nil {
-		target = base
-	}
-
-	return applyCRLToClient(target, crls)
+	return applyCRLToClient(client, crls)
 }

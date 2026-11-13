@@ -54,6 +54,14 @@ type CRLError struct {
 	Err error
 }
 
+// newCRLError wraps a formatted message in a *CRLError of the given kind.
+func newCRLError(kind CRLKind, format string, args ...interface{}) *CRLError {
+	return &CRLError{
+		Kind: kind,
+		Err:  fmt.Errorf(format, args...),
+	}
+}
+
 // Error implements the error interface.
 func (e *CRLError) Error() string {
 	if e.Err == nil {
@@ -67,28 +75,43 @@ func (e *CRLError) Unwrap() error {
 	return e.Err
 }
 
-// newCRLError wraps a formatted message in a *CRLError of the given kind.
-func newCRLError(kind CRLKind, format string, args ...interface{}) *CRLError {
-	return &CRLError{
-		Kind: kind,
-		Err:  fmt.Errorf(format, args...),
-	}
-}
-
-// crlEnabled reports whether CRL checking is configured via SopsHCVaultCRLFile.
-func crlEnabled() bool {
-	value, ok := os.LookupEnv(SopsHCVaultCRLFile)
-	return ok && strings.TrimSpace(value) != ""
-}
-
-// logCRLOutcome logs a CRL verification failure once, at the Vault request
+// logCRLError logs a CRL verification failure once, at the Vault request
 // boundary where the error surfaces.
-func logCRLOutcome(err error) {
+func logCRLError(err error) {
 	var crlErr *CRLError
 	if !errors.As(err, &crlErr) {
 		return
 	}
 	log.WithField("error", crlErr.Error()).Warn("Vault server certificate chain failed CRL check")
+}
+
+// configureCRL enables CRL checking when SopsHCVaultCRLFile is set.
+// Requires an https Vault address. When enabled it layers CRL verification
+// onto client, preserving its existing TLS settings.
+func configureCRL(address string, client *http.Client) (*http.Client, error) {
+	paths, err := getCRLFiles()
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return client, nil
+	}
+
+	log.WithField("files", len(paths)).Debug("CRL checking enabled")
+
+	if !strings.HasPrefix(strings.ToLower(address), "https://") {
+		log.WithField("address", address).Warn("CRL checking requires an https:// Vault address")
+		return nil, newCRLError(CRLKindConfig,
+			"%s is set but the Vault address %q is not an https:// endpoint; "+
+				"CRL checking requires TLS", SopsHCVaultCRLFile, address)
+	}
+
+	crls, err := loadCRLs(paths)
+	if err != nil {
+		return nil, err
+	}
+
+	return applyCRLToClient(client, crls)
 }
 
 // getCRLFiles returns the list of CRL file paths configured through the
@@ -147,6 +170,43 @@ func loadCRLs(paths []string) ([]*x509.RevocationList, error) {
 	return crls, nil
 }
 
+// parseCRLs parses one or more CRLs from the given bytes. It supports
+// PEM-encoded input (possibly containing multiple "X509 CRL" blocks) as well
+// as a single DER-encoded CRL.
+func parseCRLs(data []byte) ([]*x509.RevocationList, error) {
+	var crls []*x509.RevocationList
+
+	// Attempt PEM decoding first; fall back to raw DER if no PEM blocks are
+	// present.
+	rest := data
+	foundPEM := false
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		foundPEM = true
+		if block.Type != "X509 CRL" {
+			continue
+		}
+		crl, err := x509.ParseRevocationList(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		crls = append(crls, crl)
+	}
+	if foundPEM {
+		return crls, nil
+	}
+
+	crl, err := x509.ParseRevocationList(data)
+	if err != nil {
+		return nil, err
+	}
+	return []*x509.RevocationList{crl}, nil
+}
+
 // applyCRLToClient returns an *http.Client, derived from client, whose TLS
 // configuration performs CRL checking of the Vault server's certificate chain.
 // The provided client is not mutated.
@@ -186,43 +246,6 @@ func applyCRLToClient(client *http.Client, crls []*x509.RevocationList) (*http.C
 	transport.TLSClientConfig = tlsConfig
 	c.Transport = transport
 	return &c, nil
-}
-
-// parseCRLs parses one or more CRLs from the given bytes. It supports
-// PEM-encoded input (possibly containing multiple "X509 CRL" blocks) as well
-// as a single DER-encoded CRL.
-func parseCRLs(data []byte) ([]*x509.RevocationList, error) {
-	var crls []*x509.RevocationList
-
-	// Attempt PEM decoding first; fall back to raw DER if no PEM blocks are
-	// present.
-	rest := data
-	foundPEM := false
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		foundPEM = true
-		if block.Type != "X509 CRL" {
-			continue
-		}
-		crl, err := x509.ParseRevocationList(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		crls = append(crls, crl)
-	}
-	if foundPEM {
-		return crls, nil
-	}
-
-	crl, err := x509.ParseRevocationList(data)
-	if err != nil {
-		return nil, err
-	}
-	return []*x509.RevocationList{crl}, nil
 }
 
 // newCRLVerifier checks every non-root certificate in the chain against a
@@ -303,33 +326,4 @@ func isCertificateRevoked(cert *x509.Certificate, crl *x509.RevocationList) bool
 		}
 	}
 	return false
-}
-
-// configureCRL enables CRL checking when SopsHCVaultCRLFile is set.
-// Requires an https Vault address. When enabled it layers CRL verification
-// onto client, preserving its existing TLS settings.
-func configureCRL(address string, client *http.Client) (*http.Client, error) {
-	paths, err := getCRLFiles()
-	if err != nil {
-		return nil, err
-	}
-	if len(paths) == 0 {
-		return client, nil
-	}
-
-	log.WithField("files", len(paths)).Debug("CRL checking enabled")
-
-	if !strings.HasPrefix(strings.ToLower(address), "https://") {
-		log.WithField("address", address).Warn("CRL checking requires an https:// Vault address")
-		return nil, newCRLError(CRLKindConfig,
-			"%s is set but the Vault address %q is not an https:// endpoint; "+
-				"CRL checking requires TLS", SopsHCVaultCRLFile, address)
-	}
-
-	crls, err := loadCRLs(paths)
-	if err != nil {
-		return nil, err
-	}
-
-	return applyCRLToClient(client, crls)
 }

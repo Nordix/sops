@@ -88,8 +88,7 @@ func DecryptTree(opts DecryptTreeOpts) (dataKey []byte, err error) {
 	dataKey, err = opts.Tree.Metadata.GetDataKeyWithKeyServices(opts.KeyServices, opts.DecryptionOrder)
 	if err != nil {
 		// Classify CRL verification failures against the Vault server's
-		// certificate chain so they surface a distinct, scriptable exit code
-		// instead of the generic CouldNotRetrieveKey.
+		// certificate chain
 		if code, ok := crlExitCode(err); ok {
 			return nil, NewExitError(err, code)
 		}

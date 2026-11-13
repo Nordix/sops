@@ -236,7 +236,7 @@ func (key *MasterKey) EncryptContext(ctx context.Context, dataKey []byte) error 
 
 	secret, err := client.Logical().WriteWithContext(ctx, fullPath, encryptPayload(dataKey))
 	if err != nil {
-		logCRLOutcome(err)
+		logCRLError(err)
 		log.WithField("Path", fullPath).Info("Encryption failed")
 		return fmt.Errorf("failed to encrypt sops data key to Vault transit backend '%s': %w", fullPath, err)
 	}
@@ -289,7 +289,7 @@ func (key *MasterKey) DecryptContext(ctx context.Context) ([]byte, error) {
 
 	secret, err := client.Logical().WriteWithContext(ctx, fullPath, decryptPayload(key.EncryptedKey))
 	if err != nil {
-		logCRLOutcome(err)
+		logCRLError(err)
 		log.WithField("Path", fullPath).Info("Decryption failed")
 		return nil, fmt.Errorf("failed to decrypt sops data key from Vault transit backend '%s': %w", fullPath, err)
 	}

@@ -19,6 +19,59 @@ const (
 	SopsHCVaultCRLFile = "SOPS_HC_VAULT_CRL_FILE"
 )
 
+// CRLKind classifies a CRL (Certificate Revocation List) verification failure
+// by the remediation it calls for.
+type CRLKind int
+
+const (
+	// CRLKindConfig indicates a CRL configuration or input problem: an empty
+	// SOPS_HC_VAULT_CRL_FILE entry, a non-https Vault address, an unreadable,
+	// unparseable, or empty CRL file, or an unsupported HTTP transport.
+	// Remediation: fix the SOPS CRL configuration.
+	CRLKindConfig CRLKind = iota
+	// CRLKindNoValidCRL indicates that no currently valid CRL could be applied
+	// to the Vault server's certificate chain (no verified chain with an
+	// issuer, or no in-effect CRL signed by the issuer).
+	// Remediation: supply a current CRL for the issuer.
+	CRLKindNoValidCRL
+	// CRLKindRevoked indicates that a certificate in the Vault server's chain
+	// was found on a valid CRL. This is a security-relevant event.
+	// Remediation: rotate/replace the revoked certificate.
+	CRLKindRevoked
+)
+
+// CRLError is returned when CRL verification of the Vault server's certificate
+// chain fails. It is a typed error so that callers can distinguish CRL failures
+// from other transport errors, and distinguish CRL failure kinds from each other,
+// via errors.As — without the hcvault package needing to know about CLI exit codes.
+type CRLError struct {
+	// Kind classifies the failure for remediation and exit-code mapping.
+	Kind CRLKind
+	// Err is the underlying error carrying the human-readable detail.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *CRLError) Error() string {
+	if e.Err == nil {
+		return "CRL verification failed"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap allows errors.Is/errors.As to traverse to the underlying error.
+func (e *CRLError) Unwrap() error {
+	return e.Err
+}
+
+// newCRLError wraps a formatted message in a *CRLError of the given kind.
+func newCRLError(kind CRLKind, format string, args ...interface{}) *CRLError {
+	return &CRLError{
+		Kind: kind,
+		Err:  fmt.Errorf(format, args...),
+	}
+}
+
 // getCRLFiles returns the list of CRL file paths configured through the
 // SopsHCVaultCRLFile environment variable. Empty comma separated values are
 // treated as a configuration error.
@@ -32,7 +85,7 @@ func getCRLFiles() ([]string, error) {
 	for idx, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
-			return nil, fmt.Errorf("%s's entry %d is empty", SopsHCVaultCRLFile, idx+1)
+			return nil, newCRLError(CRLKindConfig, "%s's entry %d is empty", SopsHCVaultCRLFile, idx+1)
 		}
 		paths = append(paths, p)
 	}
@@ -46,14 +99,14 @@ func loadCRLs(paths []string) ([]*x509.RevocationList, error) {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read CRL file %q: %w", p, err)
+			return nil, newCRLError(CRLKindConfig, "cannot read CRL file %q: %w", p, err)
 		}
 		parsed, err := parseCRLs(data)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse CRL file %q: %w", p, err)
+			return nil, newCRLError(CRLKindConfig, "cannot parse CRL file %q: %w", p, err)
 		}
 		if len(parsed) == 0 {
-			return nil, fmt.Errorf("CRL file %q does not contain a certificate revocation list", p)
+			return nil, newCRLError(CRLKindConfig, "CRL file %q does not contain a certificate revocation list", p)
 		}
 		crls = append(crls, parsed...)
 	}
@@ -73,7 +126,7 @@ func applyCRLToClient(client *http.Client, crls []*x509.RevocationList) (*http.C
 	case *http.Transport:
 		transport = rt.Clone()
 	default:
-		return nil, fmt.Errorf("cannot enable CRL checking: HTTP client uses a non-standard transport (%T)", client.Transport)
+		return nil, newCRLError(CRLKindConfig, "cannot enable CRL checking: HTTP client uses a non-standard transport (%T)", client.Transport)
 	}
 
 	var tlsConfig *tls.Config
@@ -158,7 +211,7 @@ func newCRLVerifier(crls []*x509.RevocationList) func([][]byte, [][]*x509.Certif
 
 func verifiedChainWithIssuer(chains [][]*x509.Certificate) ([]*x509.Certificate, error) {
 	if len(chains) == 0 || len(chains[0]) < 2 {
-		return nil, fmt.Errorf(
+		return nil, newCRLError(CRLKindNoValidCRL,
 			"cannot perform CRL check: no verified certificate chain with an issuer",
 		)
 	}
@@ -182,7 +235,7 @@ func verifyCertificateCRL(
 	}
 
 	if len(applicable) == 0 {
-		return fmt.Errorf(
+		return newCRLError(CRLKindNoValidCRL,
 			"no valid CRL found for issuer %q of vault server certificate chain (certificate %q)",
 			issuer.Subject.CommonName,
 			cert.Subject.CommonName,
@@ -191,7 +244,7 @@ func verifyCertificateCRL(
 
 	for _, crl := range applicable {
 		if isCertificateRevoked(cert, crl) {
-			return fmt.Errorf(
+			return newCRLError(CRLKindRevoked,
 				"vault server certificate chain entry %q (serial %s) has been revoked",
 				cert.Subject.CommonName,
 				cert.SerialNumber,
@@ -230,7 +283,7 @@ func configureCRL(address string, client *http.Client) (*http.Client, error) {
 	}
 
 	if !strings.HasPrefix(strings.ToLower(address), "https://") {
-		return nil, fmt.Errorf(
+		return nil, newCRLError(CRLKindConfig,
 			"%s is set but the Vault address %q is not an https:// endpoint; "+
 				"CRL checking requires TLS", SopsHCVaultCRLFile, address)
 	}

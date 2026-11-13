@@ -3,6 +3,7 @@ package hcvault
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	logger "log"
 	"net/http"
@@ -794,11 +795,21 @@ func TestMasterKey_CRL_EndToEnd(t *testing.T) {
 		err := key.Encrypt([]byte("the data key"))
 		assert.Error(t, err)
 		assert.ErrorContains(t, err, "has been revoked")
+		var encCRLErr *CRLError
+		assert.True(t, errors.As(err, &encCRLErr), "Encrypt error should unwrap to *CRLError")
+		if encCRLErr != nil {
+			assert.Equal(t, CRLKindRevoked, encCRLErr.Kind, "revoked leaf should set CRLKindRevoked")
+		}
 
 		key.EncryptedKey = "vault:v1:ignored"
 		_, err = key.Decrypt()
 		assert.Error(t, err)
 		assert.ErrorContains(t, err, "has been revoked")
+		var decCRLErr *CRLError
+		assert.True(t, errors.As(err, &decCRLErr), "Decrypt error should unwrap to *CRLError")
+		if decCRLErr != nil {
+			assert.Equal(t, CRLKindRevoked, decCRLErr.Kind, "revoked leaf should set CRLKindRevoked")
+		}
 	})
 
 	// With a CRL that revokes nothing, CRL verification passes and a full

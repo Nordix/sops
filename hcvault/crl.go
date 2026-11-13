@@ -4,11 +4,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -72,6 +75,22 @@ func newCRLError(kind CRLKind, format string, args ...interface{}) *CRLError {
 	}
 }
 
+// crlEnabled reports whether CRL checking is configured via SopsHCVaultCRLFile.
+func crlEnabled() bool {
+	value, ok := os.LookupEnv(SopsHCVaultCRLFile)
+	return ok && strings.TrimSpace(value) != ""
+}
+
+// logCRLOutcome logs a CRL verification failure once, at the Vault request
+// boundary where the error surfaces.
+func logCRLOutcome(err error) {
+	var crlErr *CRLError
+	if !errors.As(err, &crlErr) {
+		return
+	}
+	log.WithField("error", crlErr.Error()).Warn("Vault server certificate chain failed CRL check")
+}
+
 // getCRLFiles returns the list of CRL file paths configured through the
 // SopsHCVaultCRLFile environment variable. Empty comma separated values are
 // treated as a configuration error.
@@ -85,6 +104,7 @@ func getCRLFiles() ([]string, error) {
 	for idx, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
+			log.WithField("entry", idx+1).Warn("CRL file list has an empty entry")
 			return nil, newCRLError(CRLKindConfig, "%s's entry %d is empty", SopsHCVaultCRLFile, idx+1)
 		}
 		paths = append(paths, p)
@@ -99,14 +119,28 @@ func loadCRLs(paths []string) ([]*x509.RevocationList, error) {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
+			log.WithFields(logrus.Fields{"file": p, "error": err}).Warn("Cannot read CRL file")
 			return nil, newCRLError(CRLKindConfig, "cannot read CRL file %q: %w", p, err)
 		}
 		parsed, err := parseCRLs(data)
 		if err != nil {
+			log.WithFields(logrus.Fields{"file": p, "error": err}).Warn("CRL file is not a valid CRL")
 			return nil, newCRLError(CRLKindConfig, "cannot parse CRL file %q: %w", p, err)
 		}
 		if len(parsed) == 0 {
+			log.WithField("file", p).Warn("CRL file is valid PEM but contains no X509 CRL block")
 			return nil, newCRLError(CRLKindConfig, "CRL file %q does not contain a certificate revocation list", p)
+		}
+		if log.IsLevelEnabled(logrus.DebugLevel) {
+			for _, crl := range parsed {
+				log.WithFields(logrus.Fields{
+					"file":       p,
+					"issuer":     crl.Issuer.CommonName,
+					"thisUpdate": crl.ThisUpdate,
+					"nextUpdate": crl.NextUpdate,
+					"revoked":    len(crl.RevokedCertificateEntries),
+				}).Debug("Loaded CRL")
+			}
 		}
 		crls = append(crls, parsed...)
 	}
@@ -126,6 +160,7 @@ func applyCRLToClient(client *http.Client, crls []*x509.RevocationList) (*http.C
 	case *http.Transport:
 		transport = rt.Clone()
 	default:
+		log.WithField("transport", fmt.Sprintf("%T", client.Transport)).Warn("Cannot enable CRL checking: unsupported HTTP transport")
 		return nil, newCRLError(CRLKindConfig, "cannot enable CRL checking: HTTP client uses a non-standard transport (%T)", client.Transport)
 	}
 
@@ -282,7 +317,10 @@ func configureCRL(address string, client *http.Client) (*http.Client, error) {
 		return client, nil
 	}
 
+	log.WithField("files", len(paths)).Debug("CRL checking enabled")
+
 	if !strings.HasPrefix(strings.ToLower(address), "https://") {
+		log.WithField("address", address).Warn("CRL checking requires an https:// Vault address")
 		return nil, newCRLError(CRLKindConfig,
 			"%s is set but the Vault address %q is not an https:// endpoint; "+
 				"CRL checking requires TLS", SopsHCVaultCRLFile, address)
